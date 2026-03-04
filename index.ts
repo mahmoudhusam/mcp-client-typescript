@@ -1,8 +1,9 @@
-import { Anthropic } from '@anthropic-ai/sdk';
-import {
-  MessageParam,
-  Tool,
-} from '@anthropic-ai/sdk/resources/messages/messages.mjs';
+import Groq from 'groq-sdk';
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from 'groq-sdk/resources/chat/completions';
+
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import readline from 'readline/promises';
@@ -10,21 +11,21 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-if (!ANTHROPIC_API_KEY) {
-  throw new Error('ANTHROPIC_API_KEY is not set');
+if (!GROQ_API_KEY) {
+  throw new Error('GROQ_API_KEY is not set');
 }
 
 class MCPClient {
   private mcp: Client;
-  private anthropic: Anthropic;
+  private groq: Groq;
   private transport: StdioClientTransport | null = null;
-  private tools: Tool[] = [];
+  private tools: ChatCompletionTool[] = [];
 
   constructor() {
-    this.anthropic = new Anthropic({
-      apiKey: ANTHROPIC_API_KEY,
+    this.groq = new Groq({
+      apiKey: GROQ_API_KEY,
     });
     this.mcp = new Client({
       name: 'mcp-client-cli',
@@ -55,14 +56,17 @@ class MCPClient {
       const toolsResult = await this.mcp.listTools();
       this.tools = toolsResult.tools.map((tool) => {
         return {
-          name: tool.name,
-          description: tool.description,
-          input_schema: tool.inputSchema,
+          type: 'function' as const,
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.inputSchema,
+          },
         };
       });
       console.log(
         'Connected to server with tools:',
-        this.tools.map(({ name }) => name),
+        this.tools.map((tool) => tool.function.name),
       );
     } catch (e) {
       console.log('Failed to connect to MCP server: ', e);
@@ -70,51 +74,60 @@ class MCPClient {
     }
   }
   async processQuery(query: string) {
-    const messages: MessageParam[] = [
+    const messages: ChatCompletionMessageParam[] = [
       {
         role: 'user',
         content: query,
       },
     ];
 
-    const response = await this.anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
+    let response = await this.groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile', // or 'mixtral-8x7b-32768'
       messages,
       tools: this.tools,
+      max_tokens: 1000,
     });
 
     const finalText = [];
+    const choice = response.choices[0];
 
-    for (const content of response.content) {
-      if (content.type === 'text') {
-        finalText.push(content.text);
-      } else if (content.type === 'tool_use') {
-        const toolName = content.name;
-        const toolArgs = content.input as { [x: string]: unknown } | undefined;
+    if (choice.message.content) {
+      finalText.push(choice.message.content);
+    }
+
+    // Handle tool calls
+    if (choice.message.tool_calls) {
+      for (const toolCall of choice.message.tool_calls) {
+        const toolName = toolCall.function.name;
+        const toolArgs = JSON.parse(toolCall.function.arguments);
+
+        finalText.push(
+          `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`,
+        );
 
         const result = await this.mcp.callTool({
           name: toolName,
           arguments: toolArgs,
         });
-        finalText.push(
-          `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`,
-        );
 
+        // Add assistant message and tool result to conversation
+        messages.push(choice.message);
         messages.push({
-          role: 'user',
-          content: result.content as string,
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result.content),
         });
 
-        const response = await this.anthropic.messages.create({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
+        // Get final response with tool results
+        const finalResponse = await this.groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
           messages,
+          max_tokens: 1000,
         });
 
-        finalText.push(
-          response.content[0].type === 'text' ? response.content[0].text : '',
-        );
+        if (finalResponse.choices[0].message.content) {
+          finalText.push(finalResponse.choices[0].message.content);
+        }
       }
     }
 
